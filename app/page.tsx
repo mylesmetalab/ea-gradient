@@ -5,7 +5,6 @@ import { RotateCcw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
@@ -15,7 +14,6 @@ import {
   SidebarContent,
   SidebarGroup,
   SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarProvider,
@@ -32,6 +30,14 @@ const DEFAULT_BORDER_COLORS = ["#0731AB", "#020052", "#3B6DF7", "#C7DFFF"] as co
 // Long Stop3->Stop4 fade requires a *smaller* Stop 3 offset (fade length = 1 - offset3).
 const DEFAULT_STOP_OFFSETS = [0, 0.18, 0.7, 1] as const
 
+/** Main gradient “stop spacing” slider and all bar/diamond spacing math use this range. */
+const STOP_SPACING_MIN = 0.7
+const STOP_SPACING_MAX = 1.4
+
+function clampStopSpacing(s: number) {
+  return Math.max(STOP_SPACING_MIN, Math.min(STOP_SPACING_MAX, s))
+}
+
 const PRESET_1_ANIMATION_DEFAULTS: Readonly<{
   enabled: boolean
   loopDurationSec: number
@@ -40,6 +46,69 @@ const PRESET_1_ANIMATION_DEFAULTS: Readonly<{
   enabled: true,
   loopDurationSec: 1.5,
   staggerSec: 0.35,
+}
+
+/** Bar presets 3 / 4 unchanged; New design (Preset 1 reference) uses these when that preset is applied. */
+const PRESET_1_NEW_DESIGN_ANIMATION_TIMING = {
+  loopDurationSec: 1.0,
+  staggerSec: 0.16,
+} as const
+
+/** Factory defaults for Preset 1 “reference” / diamond (Gradient Parameters panel). */
+const PRESET_1_REFERENCE_GRADIENT_DEFAULTS = {
+  stopSpacing: 0.9,
+  numBars: 10,
+  diamondCornerRadius: 0.65,
+  diamondStagger: 10,
+  diamondSpacing: 1.5,
+  diamondGradientScale: 2.0,
+  invertStopColors: true,
+} as const
+
+/** Factory defaults for Preset 2 diamond (Gradient Parameters when toolbar “2” is applied). */
+const PRESET_2_REFERENCE_GRADIENT_DEFAULTS = {
+  stopSpacing: 0.9,
+  numBars: 15,
+  diamondCornerRadius: 0.65,
+  diamondStagger: 21,
+  diamondSpacing: 1.5,
+  diamondGradientScale: 2.0,
+  invertStopColors: true,
+} as const
+
+/**
+ * Preset 2 matches `assets/Preset 2.svg`: chevrons rotated 150° on fills, stack stepped up-left
+ * (gradient centers move ~(-124, -215) per row in the 1138×1487 reference art).
+ */
+const PRESET_2_SHAPE_ROTATION_DEG = 150
+/** Unit vector along the reference stack step (up-left in screen space). */
+const PRESET_2_LR_UNIT = (() => {
+  const dx = -124
+  const dy = -215
+  const len = Math.hypot(dx, dy) || 1
+  return { lx: dx / len, ly: dy / len }
+})()
+
+/**
+ * Preset 2 parade: inner translate `v` so `rotate(deg, cx, cy) ∘ translate(v)` equals `rotate(deg, dupCx, dupCy)`
+ * on all points (same θ, pivots c and d). With M the CCW rotation matrix matching SVG `rotate(deg)`:
+ * `v = (M^T − I)(d − c)` where `c = (cx,cy)`, `d = (dupCx,dupCy)`.
+ */
+function preset2ParadeDupInnerTranslateExact(
+  cx: number,
+  cy: number,
+  dupCx: number,
+  dupCy: number,
+  deg: number
+): { tx: number; ty: number } {
+  const rad = (deg * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const dx = dupCx - cx
+  const dy = dupCy - cy
+  const tx = (cos - 1) * dx + sin * dy
+  const ty = -sin * dx + (cos - 1) * dy
+  return { tx, ty }
 }
 
 // Matches the left-to-right bar stop offsets in `assets/01.svg` (using stopSpacing=1.0)
@@ -112,15 +181,556 @@ function buildLinearFlowSyncAnimation(
 
   if (b >= aHoldEnd + 1e-5 && b < 1 - 1e-5) {
     // Hold: linear (flat). Sweep: mild ease-in (avoids lingering near rest so colors don’t read “compressed”).
-    // Return: ease-out so velocity → 0 at loop boundary.
+    // Return: stronger ease-out so velocity → 0 softly at loop boundary (sweep eased in/out as well).
     return {
       dur: `${R}s`,
       keyTimes: `0;${kt(aHoldEnd)};${kt(b)};1`,
       values: `0 0;0 0;${vx} ${vy};0 0`,
-      keySplines: "0 0 1 1; 0.28 0 0.72 1; 0 0 0.58 1",
+      keySplines: "0 0 1 1; 0.4 0 0.65 1; 0.2 0 0.4 1",
     }
   }
   return { dur: `${R}s`, keyTimes: `0;1`, values: `0 0;0 0` }
+}
+
+type DiamondReferenceLayout = "preset1" | "preset2"
+
+/** Collect reference shape center Y values (same layout as `getPreset1DiamondGeometry`). */
+function preset1ReferenceCyList(args: {
+  numBars: number
+  svgWidth: number
+  svgHeight: number
+  diamondStagger: number
+  diamondSpacing: number
+  positions: number[]
+  diamondCornerRadius: number
+  diamondLayout: DiamondReferenceLayout
+}): number[] {
+  const cys: number[] = []
+  for (let i = 0; i < args.numBars; i++) {
+    cys.push(getPreset1DiamondGeometry(i, args).cy)
+  }
+  return cys
+}
+
+/** Vertical tile pitch for Preset 1 ripple conveyor: tight vs stack spacing so one copy replaces another quickly. */
+function computeDiamondRipplePitch(args: {
+  numBars: number
+  svgWidth: number
+  svgHeight: number
+  diamondStagger: number
+  diamondSpacing: number
+  positions: number[]
+  diamondLayout: DiamondReferenceLayout
+}): number {
+  const { numBars, svgWidth, svgHeight, diamondStagger, diamondSpacing, positions } = args
+  const half = (494 / 343) * svgWidth * 0.5
+  const halfDiag = half * Math.sqrt(2)
+  const cys: number[] = []
+  for (let i = 0; i < numBars; i++) {
+    const t = numBars > 1 ? i / (numBars - 1) : 0
+    const staggerExp = 1 + (diamondStagger / 5) * (6 / Math.max(1, numBars - 1))
+    const eased = 1 - Math.pow(1 - t, staggerExp)
+    const yShift = args.diamondLayout === "preset2" ? -svgHeight * 0.72 : 0
+    const baseCy = halfDiag - 240 + eased * svgHeight * diamondSpacing + yShift
+    cys.push(baseCy + (positions[i] ?? 0))
+  }
+  if (cys.length < 2) {
+    return Math.max(56, Math.min(svgHeight * 0.5, svgHeight / Math.max(1, numBars)))
+  }
+  let sum = 0
+  for (let i = 1; i < cys.length; i++) sum += Math.abs(cys[i]! - cys[i - 1]!)
+  const avgGap = sum / (cys.length - 1)
+  return Math.max(52, Math.min(svgHeight * 0.5, avgGap * 0.62))
+}
+
+/** Parade-only: Y centers from the static stack (stagger + spacing). Conveyor step/duplicate Y are derived per row. */
+function computePreset1ParadeEqualStack(args: {
+  numBars: number
+  svgWidth: number
+  svgHeight: number
+  diamondStagger: number
+  diamondSpacing: number
+  positions: number[]
+  diamondCornerRadius: number
+  diamondLayout: DiamondReferenceLayout
+}): { paradeCys: number[] } {
+  const staticCys = preset1ReferenceCyList(args)
+  const n = staticCys.length
+  if (n < 2) {
+    const solo = staticCys[0] ?? args.svgHeight * 0.45
+    return { paradeCys: [solo] }
+  }
+  return { paradeCys: staticCys.slice() }
+}
+
+function getPreset1DiamondGeometry(
+  i: number,
+  args: {
+    numBars: number
+    svgWidth: number
+    svgHeight: number
+    diamondStagger: number
+    diamondSpacing: number
+    positions: number[]
+    diamondCornerRadius: number
+    diamondLayout?: DiamondReferenceLayout
+  }
+) {
+  const layout = args.diamondLayout ?? "preset1"
+  const half = (494 / 343) * args.svgWidth * 0.5
+  const halfDiag = half * Math.sqrt(2)
+  const t = args.numBars > 1 ? i / (args.numBars - 1) : 0
+  const staggerExp = 1 + (args.diamondStagger / 5) * (6 / Math.max(1, args.numBars - 1))
+  const eased = 1 - Math.pow(1 - t, staggerExp)
+  const yShift = layout === "preset2" ? -args.svgHeight * 0.72 : 0
+  const baseCy = halfDiag - 240 + eased * args.svgHeight * args.diamondSpacing + yShift
+  const cy = baseCy + (args.positions[i] ?? 0)
+  /** Preset 2: diagonal stack; preset 1 stays centered. */
+  const cx = layout === "preset2" ? args.svgWidth * (0.28 + 0.27 * eased) : args.svgWidth / 2
+  const rLinear = half * args.diamondCornerRadius * (1 - t * 0.85)
+  const r =
+    layout === "preset2"
+      ? Math.min(half * 0.52, rLinear * 1.22 + half * (0.06 + (1 - t) * 0.04))
+      : rLinear
+  const size = half * 2
+  return { half, halfDiag, cy, cx, r, size }
+}
+
+/**
+ * Preset 2 parade: duplicate sits on the “next” stack position. Interior rows use real `i+1` geometry;
+ * the last row extrapolates in **eased** space so the step matches the stagger curve (linear (cx,cy)
+ * extrapolation does not, and reads as a small vertical hitch on loop).
+ */
+function getPreset2ParadeDuplicateCenter(
+  rowIndex: number,
+  args: {
+    numBars: number
+    svgWidth: number
+    svgHeight: number
+    diamondStagger: number
+    diamondSpacing: number
+    positions: number[]
+    diamondCornerRadius: number
+    diamondLayout: DiamondReferenceLayout
+  }
+): { cx: number; cy: number } {
+  const n = args.numBars
+  if (rowIndex + 1 < n) {
+    const g = getPreset1DiamondGeometry(rowIndex + 1, args)
+    return { cx: g.cx, cy: g.cy }
+  }
+  if (n === 2) {
+    const g0 = getPreset1DiamondGeometry(0, args)
+    const g1 = getPreset1DiamondGeometry(1, args)
+    return { cx: 2 * g1.cx - g0.cx, cy: 2 * g1.cy - g0.cy }
+  }
+  const staggerExp = 1 + (args.diamondStagger / 5) * (6 / Math.max(1, n - 1))
+  const tPrev = (n - 2) / (n - 1)
+  const easedPrev = 1 - Math.pow(1 - tPrev, staggerExp)
+  const easedSucc = 1 + (1 - easedPrev)
+  const yShift = -args.svgHeight * 0.72
+  const half = (494 / 343) * args.svgWidth * 0.5
+  const halfDiag = half * Math.sqrt(2)
+  const baseCySucc = halfDiag - 240 + easedSucc * args.svgHeight * args.diamondSpacing + yShift
+  const i = rowIndex
+  const posLast = args.positions[i] ?? 0
+  const posPrev = args.positions[i - 1] ?? 0
+  const posSucc = posLast + (posLast - posPrev)
+  const cy = baseCySucc + posSucc
+  const cx = args.svgWidth * (0.28 + 0.27 * easedSucc)
+  return { cx, cy }
+}
+
+/**
+ * Closed triangle only (apex / optional apex rounding unchanged); straight base L–R.
+ */
+function preset1TriangleUpperPathRoundedTop(cx: number, cy: number, halfDiag: number, apexRoundPx: number): string {
+  const Tx = cx
+  const Ty = cy - halfDiag
+  const Rx = cx + halfDiag
+  const Ry = cy
+  const Lx = cx - halfDiag
+  const Ly = cy
+
+  const lenTL = Math.hypot(Lx - Tx, Ly - Ty)
+  const lenTR = Math.hypot(Rx - Tx, Ry - Ty)
+  const maxR = Math.min(lenTL, lenTR) * 0.48
+  const r = Math.min(Math.max(0, apexRoundPx), maxR)
+
+  const f = (n: number) => n.toFixed(6)
+
+  if (r < 0.5) {
+    return `M ${f(Lx)} ${f(Ly)} L ${f(Tx)} ${f(Ty)} L ${f(Rx)} ${f(Ry)} Z`
+  }
+
+  const uLx = (Lx - Tx) / lenTL
+  const uLy = (Ly - Ty) / lenTL
+  const uRx = (Rx - Tx) / lenTR
+  const uRy = (Ry - Ty) / lenTR
+
+  const Ltx = Tx + uLx * r
+  const Lty = Ty + uLy * r
+  const Rtx = Tx + uRx * r
+  const Rty = Ty + uRy * r
+
+  return `M ${f(Lx)} ${f(Ly)} L ${f(Ltx)} ${f(Lty)} Q ${f(Tx)} ${f(Ty)} ${f(Rtx)} ${f(Rty)} L ${f(Rx)} ${f(Ry)} Z`
+}
+
+/**
+ * Single closed path: rounded triangle plus strip under L–R (vertical at x=Lx/Rx, bottom edge at y=cy+h).
+ */
+function preset1DiamondMergedPath(
+  cx: number,
+  cy: number,
+  halfDiag: number,
+  apexRoundPx: number,
+  baseExtendDownPx: number
+): string {
+  const h = Math.max(0, baseExtendDownPx)
+  const Rx = cx + halfDiag
+  const Ry = cy
+  const Lx = cx - halfDiag
+  const Ly = cy
+
+  const upper = preset1TriangleUpperPathRoundedTop(cx, cy, halfDiag, apexRoundPx)
+  if (h <= 1e-6) return upper
+
+  const f = (n: number) => n.toFixed(6)
+  const open = upper.replace(/\sZ\s*$/i, "")
+  return `${open} L ${f(Rx)} ${f(Ry + h)} L ${f(Lx)} ${f(Ly + h)} Z`
+}
+
+/**
+ * Preset 2: same rounded apex as Preset 1, but the skirt uses a curved bottom edge so the silhouette
+ * reads as soft arcs instead of sharp bottom corners (especially when the stack is rotated).
+ */
+function preset2DiamondMergedPath(
+  cx: number,
+  cy: number,
+  halfDiag: number,
+  apexRoundPx: number,
+  baseExtendDownPx: number
+): string {
+  const h = Math.max(0, baseExtendDownPx)
+  const upper = preset1TriangleUpperPathRoundedTop(cx, cy, halfDiag, apexRoundPx)
+  if (h <= 1e-6) return upper
+
+  const Rx = cx + halfDiag
+  const Ry = cy
+  const Lx = cx - halfDiag
+  const Ly = cy
+  const f = (n: number) => n.toFixed(6)
+  const open = upper.replace(/\sZ\s*$/i, "").trim()
+  const bottomBow = Math.min(h * 0.34, 56, halfDiag * 0.22)
+  return `${open} L ${f(Rx)} ${f(Ry + h)} Q ${f(cx)} ${f(Ly + h + bottomBow)} ${f(Lx)} ${f(Ly + h)} Z`
+}
+
+function diamondMergedPathForLayout(
+  cx: number,
+  cy: number,
+  halfDiag: number,
+  apexRoundPx: number,
+  baseExtendDownPx: number,
+  layout: DiamondReferenceLayout
+): string {
+  return layout === "preset2"
+    ? preset2DiamondMergedPath(cx, cy, halfDiag, apexRoundPx, baseExtendDownPx)
+    : preset1DiamondMergedPath(cx, cy, halfDiag, apexRoundPx, baseExtendDownPx)
+}
+
+/**
+ * Preset 1 parade conveyor: shared period `R = (n-1)*d + T` so every row ends at `translate(0,-stepU)` together
+ * when the loop repeats. `stepU` is the per-row vertical pitch (duplicate sits one step below the primary).
+ * Hold segments are linear; the move uses spline easing so starts/stops don’t snap.
+ */
+/** Vertical strip depth under base L–R; scales with `halfDiag`. */
+const PRESET1_TRIANGLE_BASE_EXTEND_RATIO = 0.48
+/** Normalize spacing stagger (slider 0–30) when scaling skirt depth. Keep aligned with Spacing stagger `max`. */
+const PRESET1_DIAMOND_STAGGER_SLIDER_MAX = 30
+/** Extra skirt depth at max stagger: multiplier is `1 + staggerNorm * this` (at 0 → 1×, at max → ~1.85×). */
+const PRESET1_SKIRT_DEPTH_STAGGER_GAIN = 0.85
+
+/** Ease-in-out between holds so velocity eases to ~0 at the start and end of each row’s move segment. */
+const DIAMOND_CONVEYOR_MOVE_SPLINE = "0.65 0 0.35 1"
+
+function buildDiamondConveyorRowMotion(
+  rowIndex: number,
+  numRows: number,
+  loopSec: number,
+  staggerSec: number,
+  stepU: number
+): {
+  dur: string
+  begin: string
+  keyTimes: string
+  values: string
+  keySplines: string
+} {
+  const n = Math.max(1, numRows)
+  const T = Math.max(0.1, loopSec)
+  const d = Math.max(0, staggerSec)
+  const u = Math.max(0.01, stepU)
+  const ty = (-u).toFixed(6)
+  const R = (n - 1) * d + T
+
+  const si = rowIndex * d
+  const aRaw = si / R
+  const aHoldEnd = Math.max(1e-5, aRaw)
+  const b = (si + T) / R
+  const kt = (t: number) => clamp01(t).toFixed(5)
+
+  if (b >= 1 - 1e-5) {
+    return {
+      dur: `${R}s`,
+      begin: "0s",
+      keyTimes: `0;${kt(aHoldEnd)};1`,
+      values: `0 0;0 0;0 ${ty}`,
+      keySplines: `0 0 1 1;${DIAMOND_CONVEYOR_MOVE_SPLINE}`,
+    }
+  }
+  return {
+    dur: `${R}s`,
+    begin: "0s",
+    keyTimes: `0;${kt(aHoldEnd)};${kt(b)};1`,
+    values: `0 0;0 0;0 ${ty};0 ${ty}`,
+    keySplines: `0 0 1 1;${DIAMOND_CONVEYOR_MOVE_SPLINE};0 0 1 1`,
+  }
+}
+
+/** Same timing contract as `buildDiamondConveyorRowMotion`, but translate ends at `(tx, ty)` (screen axes). */
+function buildDiamondConveyorRowMotionVector(
+  rowIndex: number,
+  numRows: number,
+  loopSec: number,
+  staggerSec: number,
+  tx: number,
+  ty: number,
+  /** Preset 2: linear move segment so loop endpoints land exactly (spline easing can ease short of the final keyframe in some engines). */
+  linearMove = false
+): {
+  dur: string
+  begin: string
+  keyTimes: string
+  values: string
+  keySplines: string
+  calcMode: "linear" | "spline"
+} {
+  const n = Math.max(1, numRows)
+  const T = Math.max(0.1, loopSec)
+  const d = Math.max(0, staggerSec)
+  const R = (n - 1) * d + T
+
+  const si = rowIndex * d
+  const aRaw = si / R
+  const aHoldEnd = Math.max(1e-5, aRaw)
+  const b = (si + T) / R
+  const kt = (t: number) => clamp01(t).toFixed(8)
+  const f = (n: number) => n.toFixed(14)
+  const txf = f(tx)
+  const tyf = f(ty)
+  const moveSpline = linearMove ? "0 0 1 1" : DIAMOND_CONVEYOR_MOVE_SPLINE
+  const calcMode = linearMove ? ("linear" as const) : ("spline" as const)
+
+  if (b >= 1 - 1e-5) {
+    return {
+      dur: `${R}s`,
+      begin: "0s",
+      keyTimes: `0;${kt(aHoldEnd)};1`,
+      values: `0 0;0 0;${txf} ${tyf}`,
+      keySplines: `0 0 1 1;${moveSpline}`,
+      calcMode,
+    }
+  }
+  return {
+    dur: `${R}s`,
+    begin: "0s",
+    keyTimes: `0;${kt(aHoldEnd)};${kt(b)};1`,
+    values: `0 0;0 0;${txf} ${tyf};${txf} ${tyf}`,
+    keySplines: `0 0 1 1;${moveSpline};0 0 1 1`,
+    calcMode,
+  }
+}
+
+type Preset1DiamondRowModel = {
+  i: number
+  /** Center Y (user space); used for paint-order sort and exit distance. */
+  cy: number
+  /** Center X (user space). */
+  cx: number
+  /** Per-row conveyor pitch: translate magnitude for one loop; duplicate is one step below the primary. */
+  exitU: number
+  /** Duplicate triangle center Y (conveyor radial gradient cy when parading). */
+  dupCy: number
+  /** Duplicate triangle center X (conveyor gradient cx when parading). */
+  dupCx: number
+  /** Triangle + base skirt as one `<path d>`. */
+  trianglePath: string
+  dupTrianglePath: string
+  /** Preset 2 parade: translate inside shared `rotate(deg, cx, cy)` so dup matches the old dup-pivot pose. */
+  preset2ParadeDupAlignTx?: number
+  preset2ParadeDupAlignTy?: number
+  conveyor: {
+    dur: string
+    begin: string
+    keyTimes: string
+    values: string
+    keySplines: string
+    /** Preset 2 diagonal vector conveyor: linear segment for exact endpoint. */
+    calcMode?: "linear" | "spline"
+    /** Primary i≥1: apex rounds up toward the predecessor’s `r` during the step, then holds there. */
+    primaryPathMorphValues?: string
+  } | null
+}
+
+function buildPreset1DiamondRowModel(
+  i: number,
+  args: {
+    numBars: number
+    svgWidth: number
+    svgHeight: number
+    diamondStagger: number
+    diamondSpacing: number
+    positions: number[]
+    diamondCornerRadius: number
+    diamondRipplePitch: number
+    paradeEnabled: boolean
+    diamondLayout: DiamondReferenceLayout
+    /** Parade: full center-Y list (same length as `numBars`). */
+    paradeCys?: number[]
+    /** Parade: override center Y for this row index (must match `paradeCys[i]` when list is passed). */
+    paradeCy?: number
+    linearGradientFlowDurationSec: number
+    linearGradientStaggerSec: number
+  }
+): Preset1DiamondRowModel {
+  const geom = getPreset1DiamondGeometry(i, args)
+  const cy = args.paradeEnabled && args.paradeCy !== undefined ? args.paradeCy : geom.cy
+  const { halfDiag, cx, r: apexRoundPx } = geom
+  const n = Math.max(1, args.numBars)
+  const pc = args.paradeCys
+  const conveyorIsLowerRight = args.diamondLayout === "preset2"
+
+  let exitU = 0
+  let cyDup = cy
+  let cxDup = cx
+  /** Preset 2 parade: one-loop translate must equal primary center minus duplicate center (cx differs per row). */
+  let preset2MotionTx = 0
+  let preset2MotionTy = 0
+  let preset2ParadeDupAlignTx: number | undefined
+  let preset2ParadeDupAlignTy: number | undefined
+
+  if (args.paradeEnabled) {
+    if (conveyorIsLowerRight && pc && pc.length === n && n >= 2) {
+      const succ = getPreset2ParadeDuplicateCenter(i, args)
+      cxDup = succ.cx
+      cyDup = succ.cy
+      preset2MotionTx = cx - cxDup
+      preset2MotionTy = cy - cyDup
+      exitU = Math.max(0.01, Math.hypot(preset2MotionTx, preset2MotionTy))
+      const a = preset2ParadeDupInnerTranslateExact(cx, cy, cxDup, cyDup, PRESET_2_SHAPE_ROTATION_DEG)
+      preset2ParadeDupAlignTx = a.tx
+      preset2ParadeDupAlignTy = a.ty
+    } else if (pc && pc.length === n && n >= 2) {
+      // Preset 1: one loop = move up by gap to row above; duplicate one vertical step below primary.
+      if (i === 0) {
+        exitU = Math.max(0.01, pc[1]! - pc[0]!)
+        cyDup = pc[0]! + exitU
+      } else {
+        exitU = Math.max(0.01, pc[i]! - pc[i - 1]!)
+        cyDup = pc[i]! + exitU
+      }
+    } else {
+      exitU = Math.max(0.01, args.diamondRipplePitch)
+      if (conveyorIsLowerRight) {
+        const u = Math.max(exitU, (args.svgWidth + args.svgHeight) * 0.044)
+        cyDup = cy - PRESET_2_LR_UNIT.ly * u
+        cxDup = cx - PRESET_2_LR_UNIT.lx * u
+        preset2MotionTx = PRESET_2_LR_UNIT.lx * u
+        preset2MotionTy = PRESET_2_LR_UNIT.ly * u
+        exitU = Math.max(0.01, Math.hypot(preset2MotionTx, preset2MotionTy))
+      } else {
+        cyDup = cy + exitU
+      }
+    }
+  } else {
+    exitU = 0
+    cyDup = cy
+    cxDup = cx
+  }
+
+  const staggerNorm = Math.max(0, args.diamondStagger) / PRESET1_DIAMOND_STAGGER_SLIDER_MAX
+  const skirtDepthMultiplier = 1 + staggerNorm * PRESET1_SKIRT_DEPTH_STAGGER_GAIN
+  let baseExtendDownPx =
+    Math.max(176, halfDiag * PRESET1_TRIANGLE_BASE_EXTEND_RATIO) * skirtDepthMultiplier
+  if (args.diamondLayout === "preset2") {
+    baseExtendDownPx *= 0.78
+  }
+
+  const trianglePath = diamondMergedPathForLayout(cx, cy, halfDiag, apexRoundPx, baseExtendDownPx, args.diamondLayout)
+  const dupTrianglePath = diamondMergedPathForLayout(
+    cxDup,
+    cyDup,
+    halfDiag,
+    apexRoundPx,
+    baseExtendDownPx,
+    args.diamondLayout
+  )
+
+  const rPrev = i > 0 ? getPreset1DiamondGeometry(i - 1, args).r : apexRoundPx
+  const primaryPathTo = diamondMergedPathForLayout(cx, cy, halfDiag, rPrev, baseExtendDownPx, args.diamondLayout)
+
+  const motion = args.paradeEnabled
+    ? conveyorIsLowerRight
+      ? buildDiamondConveyorRowMotionVector(
+          i,
+          args.numBars,
+          args.linearGradientFlowDurationSec,
+          args.linearGradientStaggerSec,
+          preset2MotionTx,
+          preset2MotionTy,
+          true
+        )
+      : buildDiamondConveyorRowMotion(
+          i,
+          args.numBars,
+          args.linearGradientFlowDurationSec,
+          args.linearGradientStaggerSec,
+          exitU
+        )
+    : null
+
+  let primaryPathMorphValues: string | undefined
+  // Preset 2: skip apex morph — it shifts the path’s bounds between loop endpoints and reads as a ~y jump.
+  if (
+    args.paradeEnabled &&
+    i > 0 &&
+    motion &&
+    Math.abs(apexRoundPx - rPrev) > 0.02 &&
+    args.diamondLayout !== "preset2"
+  ) {
+    const nk = motion.keyTimes.split(";").length
+    primaryPathMorphValues =
+      nk >= 4
+        ? `${trianglePath};${trianglePath};${primaryPathTo};${primaryPathTo}`
+        : `${trianglePath};${trianglePath};${primaryPathTo}`
+  }
+
+  const conveyor = motion ? { ...motion, ...(primaryPathMorphValues ? { primaryPathMorphValues } : {}) } : null
+
+  return {
+    i,
+    cy,
+    cx,
+    exitU,
+    dupCy: cyDup,
+    dupCx: cxDup,
+    trianglePath,
+    dupTrianglePath,
+    ...(preset2ParadeDupAlignTx !== undefined && preset2ParadeDupAlignTy !== undefined
+      ? { preset2ParadeDupAlignTx, preset2ParadeDupAlignTy }
+      : {}),
+    conveyor,
+  }
 }
 
 /**
@@ -146,25 +756,21 @@ function buildTiledTranslateSyncAnimation(
   const aHoldEnd = Math.max(1e-5, aRaw)
 
   const kt = (t: number) => clamp01(t).toFixed(5)
-  // Staggered start, then a "page flip" motion:
-  // accelerate through the middle, then ease-out right before the loop boundary so the repeat feels blended.
+  // Staggered hold, then one smooth ease-in-out to the tiled endpoint so velocity eases to ~0 at the repeat
+  // (matches zero velocity at the start of the next loop) without a separate “crawl to land” segment.
   if (aHoldEnd < 1 - 1e-5) {
-    const span = 1 - aHoldEnd
-    // Bias the "fastest" point later so it feels like flipping a few pages and slowing before the next loop.
-    const mid = aHoldEnd + span * 0.72
     return {
       dur: `${R}s`,
-      keyTimes: `0;${kt(aHoldEnd)};${kt(mid)};1`,
-      values: `0 0;0 0;${(vx * 0.92).toFixed(5)} ${(vy * 0.92).toFixed(5)};${vx} ${vy}`,
-      // Hold segment: linear (flat). Flip segment: ease-in (accelerate). Settle segment: ease-out (decelerate).
-      keySplines: "0 0 1 1; 0.22 0 0.78 1; 0 0 0.58 1",
+      keyTimes: `0;${kt(aHoldEnd)};1`,
+      values: `0 0;0 0;${vx.toFixed(5)} ${vy.toFixed(5)}`,
+      keySplines: "0 0 1 1; 0.58 0 0.42 1",
     }
   }
   return { dur: `${R}s`, keyTimes: `0;1`, values: `0 0;0 0` }
 }
 
 function remapStopSpacing(offset: number, stopSpacing: number) {
-  const spacing = Math.max(0.001, Math.min(1, stopSpacing))
+  const spacing = clampStopSpacing(stopSpacing)
   return clamp01(0.5 + (offset - 0.5) * spacing)
 }
 
@@ -228,25 +834,6 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
   return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 }
 }
 
-function rgbToHex(r: number, g: number, b: number) {
-  const to = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")
-  return `#${to(r)}${to(g)}${to(b)}`
-}
-
-function srgbToLinear(c: number) {
-  const v = c / 255
-  return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)
-}
-
-function relativeLuminance(hex: string) {
-  const rgb = hexToRgb(hex)
-  if (!rgb) return 0
-  const r = srgbToLinear(rgb.r)
-  const g = srgbToLinear(rgb.g)
-  const b = srgbToLinear(rgb.b)
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b
-}
-
 function toDisplayP3ColorString(hex: string) {
   const rgb = hexToRgb(hex)
   if (!rgb) return hex
@@ -305,75 +892,6 @@ async function downloadPngFromSvg(svg: SVGSVGElement, filename: string, scale = 
   a.remove()
 }
 
-function samplePixels(imageData: ImageData, maxSamples: number) {
-  const { data, width, height } = imageData
-  const total = width * height
-  const stride = Math.max(1, Math.floor(total / maxSamples))
-  const points: Array<[number, number, number]> = []
-  for (let i = 0; i < total; i += stride) {
-    const idx = i * 4
-    const a = data[idx + 3]
-    if (a < 16) continue
-    points.push([data[idx], data[idx + 1], data[idx + 2]])
-  }
-  return points
-}
-
-function kmeans(points: Array<[number, number, number]>, k: number, iterations = 10) {
-  if (points.length === 0) return []
-  const centroids: Array<[number, number, number]> = []
-  for (let i = 0; i < k; i++) {
-    const p = points[Math.floor((i / k) * (points.length - 1))]
-    centroids.push([p[0], p[1], p[2]])
-  }
-
-  for (let it = 0; it < iterations; it++) {
-    const sums = Array.from({ length: k }, () => ({ r: 0, g: 0, b: 0, n: 0 }))
-    for (const p of points) {
-      let best = 0
-      let bestD = Infinity
-      for (let c = 0; c < k; c++) {
-        const dx = p[0] - centroids[c][0]
-        const dy = p[1] - centroids[c][1]
-        const dz = p[2] - centroids[c][2]
-        const d = dx * dx + dy * dy + dz * dz
-        if (d < bestD) {
-          bestD = d
-          best = c
-        }
-      }
-      sums[best].r += p[0]
-      sums[best].g += p[1]
-      sums[best].b += p[2]
-      sums[best].n += 1
-    }
-    for (let c = 0; c < k; c++) {
-      if (sums[c].n === 0) continue
-      centroids[c] = [sums[c].r / sums[c].n, sums[c].g / sums[c].n, sums[c].b / sums[c].n]
-    }
-  }
-
-  return centroids
-}
-
-async function extractDominantColors(file: File, k = 4): Promise<string[]> {
-  const bitmap = await createImageBitmap(file)
-  const canvas = document.createElement("canvas")
-  const maxDim = 256
-  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height))
-  canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-  canvas.height = Math.max(1, Math.round(bitmap.height * scale))
-  const ctx = canvas.getContext("2d", { willReadFrequently: true })
-  if (!ctx) return []
-  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-  const points = samplePixels(imageData, 20000)
-  const centroids = kmeans(points, k, 12)
-  const colors = centroids.map((c) => rgbToHex(c[0], c[1], c[2]))
-  colors.sort((a, b) => relativeLuminance(a) - relativeLuminance(b))
-  return colors
-}
-
 function generateCurvePositions(args: {
   curveType: CurveType
   numBars: number
@@ -419,7 +937,7 @@ function generateCurvePositions(args: {
 
 function buildStopsForBar(colors: string[], stopSpacing: number, position: number): Stop[] {
   const center = 0.5 - position / 100 // position is -50..50
-  const spacing = Math.max(0.001, Math.min(1, stopSpacing))
+  const spacing = clampStopSpacing(stopSpacing)
 
   // Offsets may be < 0 or > 1: gradient continues past the bar (objectBoundingBox); only the in-frame slice is visible.
   return colors.map((color, i) => {
@@ -431,7 +949,7 @@ function buildStopsForBar(colors: string[], stopSpacing: number, position: numbe
 
 function buildStopsForBarWithOffsets(colors: string[], offsets: readonly number[], stopSpacing: number, position: number): Stop[] {
   const center = 0.5 - position / 100 // position is -50..50
-  const spacing = Math.max(0.001, Math.min(1, stopSpacing))
+  const spacing = clampStopSpacing(stopSpacing)
 
   return colors.map((color, i) => {
     const base = offsets[i] ?? i / Math.max(1, colors.length - 1)
@@ -455,14 +973,13 @@ function computeWeightedBreaks(total: number, weights: number[]) {
 
 export default function Page() {
   const svgRef = React.useRef<SVGSVGElement | null>(null)
-  const fileInputRef = React.useRef<HTMLInputElement | null>(null)
 
   // Preview size (export uses these).
   const svgWidth = 343
   const svgHeight = 448
 
   const [barOrientation, setBarOrientation] = React.useState<Orientation>("vertical")
-  const [numBars, setNumBars] = React.useState(12)
+  const [numBars, setNumBars] = React.useState<number>(PRESET_1_REFERENCE_GRADIENT_DEFAULTS.numBars)
   const [barBandWeights, setBarBandWeights] = React.useState<number[] | null>(null)
 
   // Curve controls (these drive per-bar gradient position)
@@ -479,14 +996,28 @@ export default function Page() {
 
   // Gradient controls
   const [barGradientAngle, setBarGradientAngle] = React.useState(270)
-  const [stopSpacing, setStopSpacing] = React.useState(1.0) // 0.2x -> 3x
+  const [stopSpacing, setStopSpacing] = React.useState<number>(
+    clampStopSpacing(PRESET_1_REFERENCE_GRADIENT_DEFAULTS.stopSpacing)
+  )
   const [barThickness, setBarThickness] = React.useState(1.0) // relative to computed bar width/height
   const [barGradientKind, setBarGradientKind] = React.useState<BarGradientKind>("linear")
-  const [invertStopColors, setInvertStopColors] = React.useState(false)
-  const [diamondCornerRadius, setDiamondCornerRadius] = React.useState(0.15)
-  const [diamondStagger, setDiamondStagger] = React.useState(5)
+  const [invertStopColors, setInvertStopColors] = React.useState<boolean>(
+    PRESET_1_REFERENCE_GRADIENT_DEFAULTS.invertStopColors
+  )
+  const [diamondCornerRadius, setDiamondCornerRadius] = React.useState<number>(
+    PRESET_1_REFERENCE_GRADIENT_DEFAULTS.diamondCornerRadius
+  )
+  const [diamondStagger, setDiamondStagger] = React.useState<number>(PRESET_1_REFERENCE_GRADIENT_DEFAULTS.diamondStagger)
+  React.useEffect(() => {
+    setDiamondStagger((s) => {
+      const c = Math.min(30, Math.max(0, Math.round(s)))
+      return c === s ? s : c
+    })
+  }, [])
   const [diamondSpacing, setDiamondSpacing] = React.useState(1.5)
-  const [diamondGradientScale, setDiamondGradientScale] = React.useState(1.0)
+  const [diamondGradientScale, setDiamondGradientScale] = React.useState<number>(
+    PRESET_1_REFERENCE_GRADIENT_DEFAULTS.diamondGradientScale
+  )
   const [radialPerBarCenter, setRadialPerBarCenter] = React.useState(false)
   const [stopOffsetsOverride, setStopOffsetsOverride] = React.useState<ReadonlyArray<number> | null>(null)
   const [useRawStopOffsets, setUseRawStopOffsets] = React.useState(false)
@@ -497,26 +1028,33 @@ export default function Page() {
   const [rightBorderWidth, setRightBorderWidth] = React.useState(0.5)
   const [rightBorderColors, setRightBorderColors] = React.useState<string[]>([...DEFAULT_BORDER_COLORS])
   const [borderStopSpacing, setBorderStopSpacing] = React.useState(1.0)
-
-  const [paletteLoading, setPaletteLoading] = React.useState(false)
-  const [paletteFileName, setPaletteFileName] = React.useState<string>("")
+  const [shadowEnabled, setShadowEnabled] = React.useState(true)
+  const [shadowBlur, setShadowBlur] = React.useState(29)
+  const [shadowDx, setShadowDx] = React.useState(0)
+  const [shadowDy, setShadowDy] = React.useState(2)
+  const [shadowColor, setShadowColor] = React.useState("#253FC5")
+  const [shadowOpacity, setShadowOpacity] = React.useState(1.0)
 
   const [perBarStopOffsetsOverride, setPerBarStopOffsetsOverride] = React.useState<
     ReadonlyArray<ReadonlyArray<number>> | null
   >(null)
   const [presetBarsTransform, setPresetBarsTransform] = React.useState<string>("")
-  const [presetBackground, setPresetBackground] = React.useState<"none" | "preset1" | "preset3">("none")
-  const [activePreset, setActivePreset] = React.useState<number | null>(null)
+  const [presetBackground, setPresetBackground] = React.useState<"none" | "preset1" | "preset2" | "preset3">("preset1")
+  const [activePreset, setActivePreset] = React.useState<number | null>(1)
 
   // Global preference: only *applies* to Preset 1, but we keep the toggle state persistent.
-  const [linearGradientStaggerFlow, setLinearGradientStaggerFlow] = React.useState(PRESET_1_ANIMATION_DEFAULTS.enabled)
-  const [linearGradientFlowDurationSec, setLinearGradientFlowDurationSec] = React.useState(
-    PRESET_1_ANIMATION_DEFAULTS.loopDurationSec
+  const [linearGradientStaggerFlow, setLinearGradientStaggerFlow] = React.useState(false)
+  const [linearGradientFlowDurationSec, setLinearGradientFlowDurationSec] = React.useState<number>(
+    PRESET_1_NEW_DESIGN_ANIMATION_TIMING.loopDurationSec
   )
-  const [linearGradientStaggerSec, setLinearGradientStaggerSec] = React.useState(PRESET_1_ANIMATION_DEFAULTS.staggerSec)
+  const [linearGradientStaggerSec, setLinearGradientStaggerSec] = React.useState<number>(
+    PRESET_1_NEW_DESIGN_ANIMATION_TIMING.staggerSec
+  )
 
-  const presetHasEncodedAnimation = activePreset === 1 || activePreset === 2
-  const preset1IsReferenceMode = activePreset === 1 && presetBackground === "preset1"
+  const presetHasEncodedAnimation = activePreset === 1 || activePreset === 2 || activePreset === 5
+  const preset1DiamondRef = activePreset === 1 && presetBackground === "preset1"
+  const preset2DiamondRef = activePreset === 2 && presetBackground === "preset2"
+  const diamondReferenceMode = preset1DiamondRef || preset2DiamondRef
   const preset3Overscan = activePreset === 3 ? 1.45 : 1
   const preset3ShapeOverscanPx = activePreset === 3 ? 420 : 0
   const preset3IsReferenceMode = activePreset === 3 && presetBackground === "preset3"
@@ -619,7 +1157,12 @@ export default function Page() {
     setRightBorderWidth(0.5)
     setRightBorderColors([...DEFAULT_BORDER_COLORS])
     setBorderStopSpacing(1.0)
-    setPaletteFileName("")
+    setShadowEnabled(true)
+    setShadowBlur(29)
+    setShadowDx(0)
+    setShadowDy(2)
+    setShadowColor("#253FC5")
+    setShadowOpacity(1.0)
     setPerBarStopOffsetsOverride(null)
     setPresetBarsTransform("")
     setPresetBackground("none")
@@ -629,35 +1172,72 @@ export default function Page() {
     setLinearGradientStaggerSec(PRESET_1_ANIMATION_DEFAULTS.staggerSec)
   }, [])
 
+  /** Preset 1 “new design” / reference triangles. `enableStream` on from the “1” control; off after Reset so the static layout is visible. */
+  const applyPreset1Reference = React.useCallback(
+    (enableStream: boolean) => {
+      resetAll()
+      setActivePreset(1)
+      setPresetBackground("preset1")
+      const g = PRESET_1_REFERENCE_GRADIENT_DEFAULTS
+      setStopSpacing(clampStopSpacing(g.stopSpacing))
+      setNumBars(g.numBars)
+      setDiamondCornerRadius(g.diamondCornerRadius)
+      setDiamondStagger(g.diamondStagger)
+      setDiamondSpacing(g.diamondSpacing)
+      setDiamondGradientScale(g.diamondGradientScale)
+      setInvertStopColors(g.invertStopColors)
+      setLinearGradientFlowDurationSec(PRESET_1_NEW_DESIGN_ANIMATION_TIMING.loopDurationSec)
+      setLinearGradientStaggerSec(PRESET_1_NEW_DESIGN_ANIMATION_TIMING.staggerSec)
+      setLinearGradientStaggerFlow(enableStream)
+    },
+    [resetAll]
+  )
+
   const applyNewDesign = React.useCallback(() => {
-    resetAll()
-    setActivePreset(1)
-    setPresetBackground("preset1")
-    setStopSpacing(1.0)
-    setNumBars(10)
-    setDiamondCornerRadius(0.35)
-    setDiamondStagger(10)
-    setDiamondSpacing(1.5)
-    setDiamondGradientScale(1.0)
-    setInvertStopColors(true)
-  }, [resetAll])
+    applyPreset1Reference(true)
+  }, [applyPreset1Reference])
 
   const applyPreset1 = React.useCallback(() => {
     resetAll()
     setActivePreset(1)
+    setNumBars(11)
+    setStopSpacing(clampStopSpacing(PRESET_1_REFERENCE_GRADIENT_DEFAULTS.stopSpacing))
     // Preset selection should not auto-enable animation.
     setLinearGradientStaggerFlow(false)
     setLinearGradientFlowDurationSec(PRESET_1_ANIMATION_DEFAULTS.loopDurationSec)
     setLinearGradientStaggerSec(PRESET_1_ANIMATION_DEFAULTS.staggerSec)
   }, [resetAll])
 
-  const applyPreset2 = React.useCallback(() => {
+  /** Preset 2 (toolbar “2”): diamond reference variation — rotated stack, off-centre, conveyor toward lower-right. */
+  const applyPreset2Diamond = React.useCallback(
+    (enableStream: boolean) => {
+      resetAll()
+      setActivePreset(2)
+      setPresetBackground("preset2")
+      const g = PRESET_2_REFERENCE_GRADIENT_DEFAULTS
+      setStopSpacing(clampStopSpacing(g.stopSpacing))
+      setNumBars(g.numBars)
+      setDiamondCornerRadius(g.diamondCornerRadius)
+      setDiamondStagger(g.diamondStagger)
+      setDiamondSpacing(g.diamondSpacing)
+      setDiamondGradientScale(g.diamondGradientScale)
+      setInvertStopColors(g.invertStopColors)
+      setLinearGradientFlowDurationSec(PRESET_1_NEW_DESIGN_ANIMATION_TIMING.loopDurationSec)
+      setLinearGradientStaggerSec(PRESET_1_NEW_DESIGN_ANIMATION_TIMING.staggerSec)
+      setLinearGradientStaggerFlow(enableStream)
+    },
+    [resetAll]
+  )
+
+  /** Toolbar “4”: diagonal bar field (formerly `activePreset === 2`). */
+  const applyPresetDiagonalBars = React.useCallback(() => {
     resetAll()
-    setActivePreset(2)
+    setActivePreset(5)
+    setNumBars(11)
     // Preset selection should not auto-enable animation.
     setLinearGradientStaggerFlow(false)
     setBarOrientation("diagonal")
-    setStopSpacing(0.73)
+    setStopSpacing(clampStopSpacing(0.73))
   }, [resetAll])
 
   const applyPreset4 = React.useCallback(() => {
@@ -694,7 +1274,7 @@ export default function Page() {
     setWarpAmount(0)
     setWarpFrequency(0)
     setBarGradientAngle(270)
-    setStopSpacing(0.35)
+    setStopSpacing(clampStopSpacing(0.35))
     setBarThickness(1.0)
     setBarGradientKind("radial")
     setInvertStopColors(false)
@@ -712,29 +1292,52 @@ export default function Page() {
     setPresetBackground("preset3")
   }, [resetAll])
 
+  /** Toolbar reset: restore the active preset’s factory defaults instead of clearing to generic 12 bars / no preset. */
+  const resetToActivePresetDefaults = React.useCallback(() => {
+    if (activePreset === 1 && presetBackground === "preset1") {
+      applyPreset1Reference(false)
+      return
+    }
+    if (activePreset === 2 && presetBackground === "preset2") {
+      applyPreset2Diamond(false)
+      return
+    }
+    if (activePreset === 1) {
+      applyPreset1()
+      return
+    }
+    if (activePreset === 5) {
+      applyPresetDiagonalBars()
+      return
+    }
+    if (activePreset === 3) {
+      applyPreset3()
+      return
+    }
+    if (activePreset === 4) {
+      applyPreset4()
+      return
+    }
+    resetAll()
+  }, [
+    activePreset,
+    presetBackground,
+    applyPreset1Reference,
+    applyPreset1,
+    applyPreset2Diamond,
+    applyPresetDiagonalBars,
+    applyPreset3,
+    applyPreset4,
+    resetAll,
+  ])
 
-  // Start in Preset 1 so the animation toggle can be effective immediately.
+  // Start in Preset 1 reference (static diamonds). Button “1” enables the upward stream animation.
   const didInitPresetRef = React.useRef(false)
   React.useEffect(() => {
     if (didInitPresetRef.current) return
     didInitPresetRef.current = true
-    applyNewDesign()
-  }, [applyNewDesign])
-
-  const applyPaletteFromFile = React.useCallback(async (file: File | null) => {
-    if (!file) return
-    setPaletteLoading(true)
-    try {
-      const colors = await extractDominantColors(file, 4)
-      if (colors.length === 4) {
-        setGradientColors(colors)
-        setRightBorderColors([...colors].reverse())
-      }
-      setPaletteFileName(file.name)
-    } finally {
-      setPaletteLoading(false)
-    }
-  }, [])
+    applyPreset1Reference(false)
+  }, [applyPreset1Reference])
 
   const downloadSvg = React.useCallback(async () => {
     if (!svgRef.current) return
@@ -858,7 +1461,90 @@ export default function Page() {
     return { vx, vy }
   }, [barGradX1, barGradY1, barGradX2, barGradY2])
 
-  const presetLinearFlowEnabled = (activePreset === 1 || activePreset === 2) && linearGradientStaggerFlow && barGradientKind === "linear"
+  const diamondReferenceLayout: DiamondReferenceLayout = preset2DiamondRef ? "preset2" : "preset1"
+
+  const presetLinearFlowEnabled =
+    (activePreset === 1 || activePreset === 5) &&
+    !diamondReferenceMode &&
+    linearGradientStaggerFlow &&
+    barGradientKind === "linear"
+  /** Diamond reference presets: parade uses the same toggle/sliders but does not depend on linear bar gradients. */
+  const preset1DiamondParadeEnabled = diamondReferenceMode && linearGradientStaggerFlow
+
+  const diamondRipplePitch = React.useMemo(() => {
+    if (!diamondReferenceMode) return Math.max(56, svgHeight * 0.36)
+    return computeDiamondRipplePitch({
+      numBars,
+      svgWidth,
+      svgHeight,
+      diamondStagger,
+      diamondSpacing,
+      positions,
+      diamondLayout: diamondReferenceLayout,
+    })
+  }, [diamondReferenceLayout, diamondReferenceMode, diamondSpacing, diamondStagger, numBars, positions, svgHeight, svgWidth])
+
+  const preset1DiamondRows = React.useMemo((): Preset1DiamondRowModel[] | null => {
+    if (!diamondReferenceMode) return null
+    const rowArgs = {
+      numBars,
+      svgWidth,
+      svgHeight,
+      diamondStagger,
+      diamondSpacing,
+      positions,
+      diamondCornerRadius,
+      diamondRipplePitch,
+      linearGradientFlowDurationSec,
+      linearGradientStaggerSec,
+      diamondLayout: diamondReferenceLayout,
+    }
+
+    if (!preset1DiamondParadeEnabled) {
+      return Array.from({ length: numBars }, (_, i) =>
+        buildPreset1DiamondRowModel(i, {
+          ...rowArgs,
+          paradeEnabled: false,
+        })
+      )
+    }
+
+    const { paradeCys } = computePreset1ParadeEqualStack(rowArgs)
+
+    return Array.from({ length: numBars }, (_, i) =>
+      buildPreset1DiamondRowModel(i, {
+        ...rowArgs,
+        paradeEnabled: true,
+        paradeCys,
+        paradeCy: paradeCys[i]!,
+      })
+    )
+  }, [
+    diamondReferenceLayout,
+    diamondReferenceMode,
+    numBars,
+    svgWidth,
+    svgHeight,
+    diamondStagger,
+    diamondSpacing,
+    positions,
+    diamondCornerRadius,
+    diamondRipplePitch,
+    preset1DiamondParadeEnabled,
+    linearGradientFlowDurationSec,
+    linearGradientStaggerSec,
+  ])
+
+  /**
+   * Preset 1: ascending cy so lower shapes paint last.
+   * Preset 2: descending cy so upper/later shapes paint on top and soften visible edge stacks when rotated.
+   */
+  const preset1DiamondParadePaintRows = React.useMemo(() => {
+    if (!preset1DiamondParadeEnabled || !preset1DiamondRows) return null
+    return preset2DiamondRef
+      ? preset1DiamondRows.slice().sort((a, b) => b.cy - a.cy || a.i - b.i)
+      : preset1DiamondRows.slice().sort((a, b) => a.cy - b.cy || a.i - b.i)
+  }, [preset1DiamondParadeEnabled, preset1DiamondRows, preset2DiamondRef])
 
   const barsTransform = React.useMemo(() => {
     const parts: string[] = []
@@ -914,15 +1600,13 @@ export default function Page() {
         <SidebarHeader className="p-6">
           <div>
             <h1 className="text-2xl font-bold">Gradient Bar Editor</h1>
-            <p className="text-muted-foreground mt-1 text-sm">Warp + curve controls, palette extraction, borders, exports.</p>
+            <p className="text-muted-foreground mt-1 text-sm">Create animated or static patterns. Download as SVG or MP4.</p>
             <div className="mt-4 flex flex-wrap gap-2">
               <Button type="button" onClick={downloadSvg}>
                 Download SVG
               </Button>
-              <Button type="button" onClick={downloadPng}>
-                Download PNG (4×)
-              </Button>
-              <Button type="button" variant="outline" onClick={resetAll}>
+
+              <Button type="button" variant="outline" onClick={resetToActivePresetDefaults}>
                 <RotateCcw className="h-4 w-4 mr-2" />
                 Reset
               </Button>
@@ -932,7 +1616,6 @@ export default function Page() {
 
         <SidebarContent className="px-6 pb-6">
           <SidebarGroup className="px-0">
-            <SidebarGroupLabel className="px-0 text-muted-foreground">Controls</SidebarGroupLabel>
             <SidebarGroupContent className="px-0 space-y-6">
               <Card>
                 <CardHeader className="pb-3">
@@ -943,13 +1626,13 @@ export default function Page() {
                     <Button type="button" variant="outline" onClick={applyNewDesign} className="w-full justify-center">
                       1
                     </Button>
-                    <Button type="button" variant="outline" disabled className="w-full justify-center">
+                    <Button type="button" variant="outline" onClick={() => applyPreset2Diamond(true)} className="w-full justify-center">
                       2
                     </Button>
                     <Button type="button" variant="outline" onClick={applyPreset1} className="w-full justify-center">
                       3
                     </Button>
-                    <Button type="button" variant="outline" onClick={applyPreset2} className="w-full justify-center">
+                    <Button type="button" variant="outline" onClick={applyPresetDiagonalBars} className="w-full justify-center">
                       4
                     </Button>
                   </div>
@@ -966,7 +1649,11 @@ export default function Page() {
                       htmlFor="linear-stagger-flow"
                       className={presetHasEncodedAnimation ? "cursor-pointer" : "cursor-not-allowed opacity-60"}
                     >
-                      Staggered linear gradient flow
+                      {preset1DiamondRef
+                        ? "Upward stream"
+                        : preset2DiamondRef
+                          ? "Drift along stack"
+                          : "Staggered linear gradient flow"}
                     </Label>
                     <Switch
                       id="linear-stagger-flow"
@@ -975,30 +1662,27 @@ export default function Page() {
                       disabled={!presetHasEncodedAnimation}
                     />
                   </div>
-                  <p className="text-xs text-muted-foreground leading-relaxed">
-                    Linear gradients only. Stops and spread mode stay the same as Preset 1 when off—no layout jump on
-                    toggle. Each bar waits, sweeps in order, returns to rest, then all hold before the next cycle. Preset
-                    1 turns this on.
-                  </p>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Loop duration</Label>
                       <span className="text-xs tabular-nums text-muted-foreground">
-                        {linearGradientFlowDurationSec.toFixed(1)}s
+                        {linearGradientFlowDurationSec.toFixed(2)}s
                       </span>
                     </div>
                     <Slider
                       value={[linearGradientFlowDurationSec]}
                       onValueChange={([v]) => setLinearGradientFlowDurationSec(v)}
-                      min={0.8}
-                      max={14}
-                      step={0.1}
+                      min={0.1}
+                      max={2}
+                      step={0.01}
                       disabled={!presetHasEncodedAnimation || !linearGradientStaggerFlow}
                     />
                   </div>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label>Stagger between bars</Label>
+                      <Label>
+                        {diamondReferenceMode ? "Stagger between shapes" : "Stagger between bars"}
+                      </Label>
                       <span className="text-xs tabular-nums text-muted-foreground">
                         {linearGradientStaggerSec.toFixed(2)}s
                       </span>
@@ -1012,17 +1696,6 @@ export default function Page() {
                       disabled={!presetHasEncodedAnimation || !linearGradientStaggerFlow}
                     />
                   </div>
-                  {linearGradientStaggerFlow ? (
-                    <p className="text-xs tabular-nums text-muted-foreground">
-                      Full cycle ≈{" "}
-                      {(
-                        (Math.max(1, numBars) - 1) * linearGradientStaggerSec +
-                        linearGradientFlowDurationSec +
-                        linearFlowTailPadSec(linearGradientFlowDurationSec)
-                      ).toFixed(1)}
-                      s
-                    </p>
-                  ) : null}
                 </CardContent>
               </Card>
 
@@ -1031,7 +1704,7 @@ export default function Page() {
                   <CardTitle className="text-base">Gradient Parameters</CardTitle>
                 </CardHeader>
                 <CardContent className={`space-y-6 ${preset3EditorLocked ? "opacity-50 grayscale pointer-events-none" : ""}`}>
-                  {preset1IsReferenceMode ? (
+                  {diamondReferenceMode ? (
                     <div className="flex items-center justify-between">
                       <Label>Invert gradient</Label>
                       <Switch checked={invertStopColors} onCheckedChange={setInvertStopColors} />
@@ -1060,30 +1733,30 @@ export default function Page() {
                     </div>
                     <Slider
                       value={[stopSpacing]}
-                      onValueChange={([v]) => setStopSpacing(v)}
-                      min={0.001}
-                      max={1}
-                      step={0.001}
+                      onValueChange={([v]) => setStopSpacing(clampStopSpacing(v))}
+                      min={STOP_SPACING_MIN}
+                      max={STOP_SPACING_MAX}
+                      step={0.005}
                       disabled={preset3EditorLocked}
                     />
                   </div>
 
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label>{preset1IsReferenceMode ? "Number of shapes" : "Number of bars"}</Label>
+                      <Label>{diamondReferenceMode ? "Number of shapes" : "Number of bars"}</Label>
                       <span className="text-xs tabular-nums text-muted-foreground">{numBars}</span>
                     </div>
                     <Slider
                       value={[numBars]}
-                      onValueChange={([v]) => setNumBars(Math.max(preset1IsReferenceMode ? 4 : 1, Math.min(preset1IsReferenceMode ? 15 : 150, v)))}
-                      min={preset1IsReferenceMode ? 4 : 1}
-                      max={preset1IsReferenceMode ? 15 : 150}
+                      onValueChange={([v]) => setNumBars(Math.max(diamondReferenceMode ? 4 : 1, Math.min(diamondReferenceMode ? 15 : 150, v)))}
+                      min={diamondReferenceMode ? 4 : 1}
+                      max={diamondReferenceMode ? 15 : 150}
                       step={1}
                       disabled={preset3EditorLocked}
                     />
                   </div>
 
-                  {preset1IsReferenceMode && (
+                  {diamondReferenceMode && (
                     <>
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
@@ -1101,14 +1774,16 @@ export default function Page() {
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <Label>Spacing stagger</Label>
-                        <span className="text-xs tabular-nums text-muted-foreground">{diamondStagger.toFixed(1)}</span>
+                        <span className="text-xs tabular-nums text-muted-foreground">{diamondStagger}</span>
                       </div>
                       <Slider
                         value={[diamondStagger]}
-                        onValueChange={([v]) => setDiamondStagger(v)}
+                        onValueChange={([v]) =>
+                          setDiamondStagger(Math.min(30, Math.max(0, Math.round(Number(v)))))
+                        }
                         min={0}
-                        max={50}
-                        step={0.1}
+                        max={30}
+                        step={1}
                       />
                     </div>
                     <div className="space-y-2">
@@ -1142,12 +1817,12 @@ export default function Page() {
                 </CardContent>
               </Card>
 
-              <Card>
+              {!diamondReferenceMode && <Card>
                 <CardHeader className="pb-3">
                   <CardTitle className="text-base">Positioning</CardTitle>
                 </CardHeader>
                 <CardContent className={`space-y-6 ${preset3EditorLocked ? "opacity-50 grayscale pointer-events-none" : ""}`}>
-                  {!preset1IsReferenceMode && (
+                  {!diamondReferenceMode && (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Bar orientation</Label>
@@ -1173,7 +1848,7 @@ export default function Page() {
                   </div>
                   )}
 
-                  {!preset1IsReferenceMode && (
+                  {!diamondReferenceMode && (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Amplitude</Label>
@@ -1183,7 +1858,7 @@ export default function Page() {
                   </div>
                   )}
 
-                  {!preset1IsReferenceMode && (
+                  {!diamondReferenceMode && (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Phase shift</Label>
@@ -1193,7 +1868,7 @@ export default function Page() {
                   </div>
                   )}
 
-                  {!preset1IsReferenceMode && (
+                  {!diamondReferenceMode && (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label>Vertical offset</Label>
@@ -1213,7 +1888,7 @@ export default function Page() {
                   </div>
                   )}
 
-                  {!preset1IsReferenceMode && (
+                  {!diamondReferenceMode && (
                   <div className="space-y-2">
                     <Label>Curve</Label>
                     <ToggleGroup
@@ -1243,7 +1918,7 @@ export default function Page() {
                   </div>
                   )}
 
-                  {(preset1IsReferenceMode || curveType === "custom") ? (
+                  {(diamondReferenceMode || curveType === "custom") ? (
                     <div className="space-y-3 pt-2">
                       <Label>Custom positions</Label>
                       <div className="space-y-2">
@@ -1273,166 +1948,15 @@ export default function Page() {
                     </div>
                   ) : null}
                 </CardContent>
-              </Card>
+              </Card>}
 
-              <Card>
-                <CardHeader className="pb-3">
-                  <CardTitle className="text-base">Gradient Colors</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => applyPaletteFromFile(e.target.files?.[0] ?? null)}
-                  />
-
-                  <div className="flex items-center gap-2">
-                    <Button type="button" variant="outline" onClick={() => fileInputRef.current?.click()} disabled={paletteLoading}>
-                      Choose file
-                    </Button>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm text-muted-foreground">{paletteFileName || "No file selected"}</div>
-                    </div>
-                  </div>
-
-                  {gradientColors.map((c, i) => (
-                    <div
-                      key={i}
-                      className="flex items-center gap-3"
-                    >
-                      <div
-                        className="h-6 w-6 rounded border border-border"
-                        style={{ backgroundColor: c }}
-                        aria-hidden="true"
-                      />
-                      <div className="text-sm text-muted-foreground w-14 shrink-0">
-                        Stop {i + 1}
-                      </div>
-                      <Input
-                        type="color"
-                        value={c}
-                        onChange={(e) => {
-                          const v = e.target.value
-                          setGradientColors((prev) => {
-                            const next = [...prev]
-                            next[i] = v
-                            return next
-                          })
-                        }}
-                        className="h-10 w-12 p-1 shrink-0"
-                      />
-                      <Input
-                        value={c}
-                        onChange={(e) => {
-                          const v = e.target.value
-                          setGradientColors((prev) => {
-                            const next = [...prev]
-                            next[i] = v
-                            return next
-                          })
-                        }}
-                        className="min-w-0 flex-1"
-                      />
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader className="pb-3">
-                  <CardTitle className="text-base">Borders</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="flex items-center justify-between gap-4">
-                    <Label>Edge border</Label>
-                    <Switch checked={rightBorderEnabled} onCheckedChange={setRightBorderEnabled} />
-                  </div>
-
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Thickness</Label>
-                      <span className="text-xs tabular-nums text-muted-foreground">{rightBorderWidth.toFixed(1)}px</span>
-                    </div>
-                    <Slider
-                      value={[rightBorderWidth]}
-                      onValueChange={([v]) => setRightBorderWidth(v)}
-                      min={0.1}
-                      max={100}
-                      step={0.1}
-                      disabled={!rightBorderEnabled}
-                    />
-                  </div>
-
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Stop spacing</Label>
-                      <span className="text-xs tabular-nums text-muted-foreground">{borderStopSpacing.toFixed(2)}×</span>
-                    </div>
-                    <Slider
-                      value={[borderStopSpacing]}
-                      onValueChange={([v]) => setBorderStopSpacing(v)}
-                      min={0.01}
-                      max={2.0}
-                      step={0.01}
-                      disabled={!rightBorderEnabled}
-                    />
-                  </div>
-
-                  <div className="space-y-4">
-                    {rightBorderColors.map((c, i) => (
-                      <div
-                        key={i}
-                        className="flex items-center gap-3"
-                      >
-                        <div
-                          className="h-6 w-6 rounded border border-border"
-                          style={{ backgroundColor: c }}
-                          aria-hidden="true"
-                        />
-                        <div className="text-sm text-muted-foreground w-14 shrink-0">
-                          Stop {i + 1}
-                        </div>
-                        <Input
-                          type="color"
-                          value={c}
-                          onChange={(e) => {
-                            const v = e.target.value
-                            setRightBorderColors((prev) => {
-                              const next = [...prev]
-                              next[i] = v
-                              return next
-                            })
-                          }}
-                          className="h-10 w-12 p-1 shrink-0"
-                          disabled={!rightBorderEnabled}
-                        />
-                        <Input
-                          value={c}
-                          onChange={(e) => {
-                            const v = e.target.value
-                            setRightBorderColors((prev) => {
-                              const next = [...prev]
-                              next[i] = v
-                              return next
-                            })
-                          }}
-                          className="min-w-0 flex-1"
-                          disabled={!rightBorderEnabled}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
             </SidebarGroupContent>
           </SidebarGroup>
         </SidebarContent>
       </Sidebar>
 
-      <SidebarInset className="flex items-center justify-center p-6 overflow-hidden">
-        <div className="w-full h-full max-w-[1000px] max-h-[1000px] overflow-hidden flex items-center justify-center">
+      <SidebarInset className="relative z-0 flex min-w-0 items-center justify-center overflow-hidden p-6">
+        <div className="isolate flex h-full w-full max-h-[1000px] max-w-[1000px] items-center justify-center overflow-hidden">
           <svg
             ref={svgRef}
             width={svgWidth}
@@ -1445,6 +1969,16 @@ export default function Page() {
             colorInterpolation="linearRGB"
           >
             <g clipPath="url(#frame-clip)">
+              {diamondReferenceMode ? (
+                <rect
+                  x={0}
+                  y={0}
+                  width={svgWidth}
+                  height={svgHeight}
+                  fill={gradientColors[Math.min(gradientColors.length - 1, invertStopColors ? 2 : 1)] ?? "#1a1a2e"}
+                  fillOpacity={0.22}
+                />
+              ) : null}
               {presetBackground === "preset3" ? (
                 <>
                   <rect
@@ -1465,44 +1999,112 @@ export default function Page() {
                 </>
               ) : null}
 
-              {preset1IsReferenceMode ? (
-                // Stacked rotated-square (diamond) shapes from Reference-for-preset-1.svg.
-                // numBars controls how many diamonds are visible.
-                // positions[i] (from curveType/phaseShift/verticalOffset) offsets each diamond's Y center.
-                // Two passes: fills first, then borders on top so borders aren't hidden by subsequent shapes.
+              {diamondReferenceMode && preset1DiamondRows ? (
                 <g>
-                  {Array.from({ length: numBars }, (_, i) => {
-                    const half = (494 / 343) * svgWidth * 0.5
-                    const halfDiag = half * Math.sqrt(2)
-                    const t = numBars > 1 ? i / (numBars - 1) : 0
-                    const staggerExp = 1 + (diamondStagger / 5) * (6 / Math.max(1, numBars - 1))
-                    const eased = 1 - Math.pow(1 - t, staggerExp)
-                    const baseCy = halfDiag - 240 + eased * svgHeight * diamondSpacing
-                    const cy = baseCy + (positions[i] ?? 0)
-                    const cx = svgWidth / 2
-                    const r = half * diamondCornerRadius * (1 - t * 0.85)
-                    const size = half * 2
-                    return (
-                      <rect
-                        key={i}
-                        x={cx - half}
-                        y={cy - half}
-                        width={size}
-                        height={size}
-                        rx={r}
-                        ry={r}
-                        fill={`url(#preset1-diamond-grad-${i})`}
-                        stroke={rightBorderEnabled ? `url(#preset1-diamond-border-${i})` : "none"}
-                        strokeWidth={rightBorderEnabled ? rightBorderWidth : 0}
-                        paintOrder="stroke fill"
-                        transform={`rotate(45 ${cx} ${cy})`}
-                      />
+                  {!preset1DiamondParadeEnabled ? (
+                    (preset2DiamondRef ? preset1DiamondRows.slice().reverse() : preset1DiamondRows).map((row) =>
+                      preset2DiamondRef ? (
+                        <g key={row.i} transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.cx} ${row.cy})`}>
+                          <path d={row.trianglePath} fill={`url(#preset1-diamond-grad-${row.i})`} />
+                        </g>
+                      ) : (
+                        <path
+                          key={row.i}
+                          d={row.trianglePath}
+                          fill={`url(#preset1-diamond-grad-${row.i})`}
+                        />
+                      )
                     )
-                  })}
+                  ) : (
+                    <>
+                      {/* Duplicates under primaries; sorted by cy so overlaps stack predictably. */}
+                      <g>
+                        {preset1DiamondParadePaintRows!.map((row) => {
+                          const c = row.conveyor!
+                          return (
+                            <g key={`d-${row.i}`}>
+                              <animateTransform
+                                attributeName="transform"
+                                type="translate"
+                                additive="replace"
+                                dur={c.dur}
+                                begin={c.begin}
+                                calcMode={c.calcMode ?? "spline"}
+                                keyTimes={c.keyTimes}
+                                values={c.values}
+                                keySplines={c.keySplines}
+                                repeatCount="indefinite"
+                              />
+                              {preset2DiamondRef ? (
+                                row.preset2ParadeDupAlignTx != null && row.preset2ParadeDupAlignTy != null ? (
+                                  <g transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.cx} ${row.cy})`}>
+                                    <g
+                                      transform={`translate(${row.preset2ParadeDupAlignTx.toFixed(14)} ${row.preset2ParadeDupAlignTy.toFixed(14)})`}
+                                    >
+                                      <path d={row.dupTrianglePath} fill={`url(#preset1-diamond-grad-${row.i}-conveyor)`} />
+                                    </g>
+                                  </g>
+                                ) : (
+                                  <g transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.dupCx} ${row.dupCy})`}>
+                                    <path d={row.dupTrianglePath} fill={`url(#preset1-diamond-grad-${row.i}-conveyor)`} />
+                                  </g>
+                                )
+                              ) : (
+                                <path d={row.dupTrianglePath} fill={`url(#preset1-diamond-grad-${row.i}-conveyor)`} />
+                              )}
+                            </g>
+                          )
+                        })}
+                      </g>
+                      <g>
+                        {preset1DiamondParadePaintRows!.map((row) => {
+                          const c = row.conveyor!
+                          const primaryPath = (
+                            <path d={row.trianglePath} fill={`url(#preset1-diamond-grad-${row.i})`}>
+                              {c.primaryPathMorphValues ? (
+                                <animate
+                                  attributeName="d"
+                                  attributeType="XML"
+                                  dur={c.dur}
+                                  begin={c.begin}
+                                  values={c.primaryPathMorphValues}
+                                  keyTimes={c.keyTimes}
+                                  calcMode="spline"
+                                  keySplines={c.keySplines}
+                                  repeatCount="indefinite"
+                                />
+                              ) : null}
+                            </path>
+                          )
+                          return (
+                            <g key={`p-${row.i}`}>
+                              <animateTransform
+                                attributeName="transform"
+                                type="translate"
+                                additive="replace"
+                                dur={c.dur}
+                                begin={c.begin}
+                                calcMode={c.calcMode ?? "spline"}
+                                keyTimes={c.keyTimes}
+                                values={c.values}
+                                keySplines={c.keySplines}
+                                repeatCount="indefinite"
+                              />
+                              {preset2DiamondRef ? (
+                                <g transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.cx} ${row.cy})`}>{primaryPath}</g>
+                              ) : (
+                                primaryPath
+                              )}
+                            </g>
+                          )
+                        })}
+                      </g>
+                    </>
+                  )}
                 </g>
               ) : null}
 
-              {!preset1IsReferenceMode && <g transform={barsTransform}>
+              {!diamondReferenceMode && <g transform={barsTransform}>
                 {barOrientation === "vertical" || barOrientation === "diagonal"
                   ? Array.from({ length: effectiveRenderCount }, (_, idx) => {
                       const x0 = xs[idx]
@@ -1524,7 +2126,7 @@ export default function Page() {
                         (barOrientation === "vertical" || barOrientation === "diagonal") &&
                         linearGradientStaggerSec > 0
 
-                      // Preset 1 & 2 animation: move the bar geometry itself with stacked tiles:
+                      // Preset 1 / diagonal-bar preset: move the bar geometry itself with stacked tiles:
                       // row 0 = normal, row 1 = stop colors flipped (1↔4), row 2 = normal again.
                       // Animate 0 → -2H so the loop lands on the same (normal) row.
                       const barFlow = shouldTileMoveBars
@@ -1739,7 +2341,6 @@ export default function Page() {
               <clipPath id="frame-clip">
                 <rect x="0" y="0" width={svgWidth} height={svgHeight} />
               </clipPath>
-
               {preset3IsReferenceMode ? (
                 <>
                   {/* Band clip paths (match the reference SVG band bounds). */}
@@ -2026,53 +2627,55 @@ export default function Page() {
                     )
                   })
                 : null}
-              {preset1IsReferenceMode
+              {diamondReferenceMode && preset1DiamondRows
                 ? Array.from({ length: numBars }, (_, i) => {
                     const half = (494 / 343) * svgWidth * 0.5
                     const halfDiag = half * Math.sqrt(2)
-                    const t = numBars > 1 ? i / (numBars - 1) : 0
-                    const staggerExp = 1 + (diamondStagger / 5) * (6 / Math.max(1, numBars - 1))
-                    const eased = 1 - Math.pow(1 - t, staggerExp)
-                    const baseCy = halfDiag - 240 + eased * svgHeight * diamondSpacing
-                    const cy = baseCy + (positions[i] ?? 0)
-                    const cx = svgWidth / 2
+                    const row = preset1DiamondRows[i]!
+                    const gradCx = row.cx
+                    const gradCy = row.cy
+                    const dupGradCy = row.dupCy
+                    const dupGradCx = row.dupCx
+                    const gradAngle = preset2DiamondRef ? 0 : 45
                     // Gradient size: radius so scale=1 puts stop 4 at the shape corner (halfDiag from center).
                     // Stop spacing: compresses stops 1–3 toward stop 4 (the edge).
                     const r = halfDiag * diamondGradientScale
-                    const s = stopSpacing
+                    const s = clampStopSpacing(stopSpacing)
                     const off1 = Math.max(0, 1 - s)
                     const off2 = Math.max(0, 1 - s * (2 / 3))
                     const off3 = Math.max(0, 1 - s * (1 / 3))
-                    const gradCx = cx
-                    const gradCy = cy
-                    // Border: linear gradient using the border stop colors from the Borders card.
                     return (
                       <React.Fragment key={i}>
-                        <radialGradient
+                        <linearGradient
                           id={`preset1-diamond-grad-${i}`}
-                          cx={gradCx}
-                          cy={gradCy}
-                          r={r}
+                          x1={gradCx}
+                          y1={gradCy - r}
+                          x2={gradCx}
+                          y2={gradCy + r}
                           gradientUnits="userSpaceOnUse"
+                          gradientTransform={`rotate(${gradAngle} ${gradCx} ${gradCy})`}
                         >
                           <stop offset={off1} stopColor={invertStopColors ? gradientColors[3] : gradientColors[0]} />
                           <stop offset={off2} stopColor={invertStopColors ? gradientColors[2] : gradientColors[1]} />
                           <stop offset={off3} stopColor={invertStopColors ? gradientColors[1] : gradientColors[2]} />
                           <stop offset="1" stopColor={invertStopColors ? gradientColors[0] : gradientColors[3]} />
-                        </radialGradient>
-                        <linearGradient
-                          id={`preset1-diamond-border-${i}`}
-                          x1={cx}
-                          y1={0}
-                          x2={cx}
-                          y2={svgHeight}
-                          gradientUnits="userSpaceOnUse"
-                        >
-                          <stop offset={clamp01(0.5 + (0    - 0.5) * borderStopSpacing)} stopColor={rightBorderColors[0]} />
-                          <stop offset={clamp01(0.5 + (0.33 - 0.5) * borderStopSpacing)} stopColor={rightBorderColors[1]} />
-                          <stop offset={clamp01(0.5 + (0.66 - 0.5) * borderStopSpacing)} stopColor={rightBorderColors[2]} />
-                          <stop offset={clamp01(0.5 + (1    - 0.5) * borderStopSpacing)} stopColor={rightBorderColors[3]} />
                         </linearGradient>
+                        {preset1DiamondParadeEnabled ? (
+                          <linearGradient
+                            id={`preset1-diamond-grad-${i}-conveyor`}
+                            x1={dupGradCx}
+                            y1={dupGradCy - r}
+                            x2={dupGradCx}
+                            y2={dupGradCy + r}
+                            gradientUnits="userSpaceOnUse"
+                            gradientTransform={`rotate(${gradAngle} ${dupGradCx} ${dupGradCy})`}
+                          >
+                            <stop offset={off1} stopColor={invertStopColors ? gradientColors[3] : gradientColors[0]} />
+                            <stop offset={off2} stopColor={invertStopColors ? gradientColors[2] : gradientColors[1]} />
+                            <stop offset={off3} stopColor={invertStopColors ? gradientColors[1] : gradientColors[2]} />
+                            <stop offset="1" stopColor={invertStopColors ? gradientColors[0] : gradientColors[3]} />
+                          </linearGradient>
+                        ) : null}
                       </React.Fragment>
                     )
                   })
