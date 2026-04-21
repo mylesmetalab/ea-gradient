@@ -111,6 +111,21 @@ function preset2ParadeDupInnerTranslateExact(
   return { tx, ty }
 }
 
+/**
+ * Single `matrix(a,b,c,d,e,f)` for `rotate(deg,c) ∘ translate(v)` with `v` from
+ * {@link preset2ParadeDupInnerTranslateExact}, matching SVG `rotate(deg cx cy)` then inner translate.
+ */
+function preset2ParadeDupComposeMatrixString(cx: number, cy: number, dupCx: number, dupCy: number, deg: number): string {
+  const { tx: vx, ty: vy } = preset2ParadeDupInnerTranslateExact(cx, cy, dupCx, dupCy, deg)
+  const rad = (deg * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const e = cos * vx - sin * vy + (1 - cos) * cx + sin * cy
+  const f = sin * vx + cos * vy - sin * cx + (1 - cos) * cy
+  const fmt = (n: number) => n.toFixed(14)
+  return `matrix(${fmt(cos)} ${fmt(sin)} ${fmt(-sin)} ${fmt(cos)} ${fmt(e)} ${fmt(f)})`
+}
+
 // Matches the left-to-right bar stop offsets in `assets/01.svg` (using stopSpacing=1.0)
 // offset0 sequence: 0.221154, 0.139423, 0.0961538, 0.0961538, 0, 0.0961538, 0.0961538, 0.139423, 0.221154
 const DEFAULT_CUSTOM_POSITIONS_01SVG = [-22.1154, -13.9423, -9.6154, -9.6154, 0, -9.6154, -9.6154, -13.9423, -22.1154] as const
@@ -566,9 +581,8 @@ type Preset1DiamondRowModel = {
   /** Triangle + base skirt as one `<path d>`. */
   trianglePath: string
   dupTrianglePath: string
-  /** Preset 2 parade: translate inside shared `rotate(deg, cx, cy)` so dup matches the old dup-pivot pose. */
-  preset2ParadeDupAlignTx?: number
-  preset2ParadeDupAlignTy?: number
+  /** Preset 2 parade: `matrix(...)` = `rotate(deg,cx,cy) ∘ translate(v)` so dup matches dup-pivot rotation under one transform. */
+  preset2ParadeDupStaticMatrix?: string
   conveyor: {
     dur: string
     begin: string
@@ -616,8 +630,7 @@ function buildPreset1DiamondRowModel(
   /** Preset 2 parade: one-loop translate must equal primary center minus duplicate center (cx differs per row). */
   let preset2MotionTx = 0
   let preset2MotionTy = 0
-  let preset2ParadeDupAlignTx: number | undefined
-  let preset2ParadeDupAlignTy: number | undefined
+  let preset2ParadeDupStaticMatrix: string | undefined
 
   if (args.paradeEnabled) {
     if (conveyorIsLowerRight && pc && pc.length === n && n >= 2) {
@@ -627,9 +640,13 @@ function buildPreset1DiamondRowModel(
       preset2MotionTx = cx - cxDup
       preset2MotionTy = cy - cyDup
       exitU = Math.max(0.01, Math.hypot(preset2MotionTx, preset2MotionTy))
-      const a = preset2ParadeDupInnerTranslateExact(cx, cy, cxDup, cyDup, PRESET_2_SHAPE_ROTATION_DEG)
-      preset2ParadeDupAlignTx = a.tx
-      preset2ParadeDupAlignTy = a.ty
+      preset2ParadeDupStaticMatrix = preset2ParadeDupComposeMatrixString(
+        cx,
+        cy,
+        cxDup,
+        cyDup,
+        PRESET_2_SHAPE_ROTATION_DEG
+      )
     } else if (pc && pc.length === n && n >= 2) {
       // Preset 1: one loop = move up by gap to row above; duplicate one vertical step below primary.
       if (i === 0) {
@@ -726,9 +743,7 @@ function buildPreset1DiamondRowModel(
     dupCx: cxDup,
     trianglePath,
     dupTrianglePath,
-    ...(preset2ParadeDupAlignTx !== undefined && preset2ParadeDupAlignTy !== undefined
-      ? { preset2ParadeDupAlignTx, preset2ParadeDupAlignTy }
-      : {}),
+    ...(preset2ParadeDupStaticMatrix !== undefined ? { preset2ParadeDupStaticMatrix } : {}),
     conveyor,
   }
 }
@@ -2036,14 +2051,12 @@ export default function Page() {
                                 repeatCount="indefinite"
                               />
                               {preset2DiamondRef ? (
-                                row.preset2ParadeDupAlignTx != null && row.preset2ParadeDupAlignTy != null ? (
-                                  <g transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.cx} ${row.cy})`}>
-                                    <g
-                                      transform={`translate(${row.preset2ParadeDupAlignTx.toFixed(14)} ${row.preset2ParadeDupAlignTy.toFixed(14)})`}
-                                    >
-                                      <path d={row.dupTrianglePath} fill={`url(#preset1-diamond-grad-${row.i}-conveyor)`} />
-                                    </g>
-                                  </g>
+                                row.preset2ParadeDupStaticMatrix ? (
+                                  <path
+                                    transform={row.preset2ParadeDupStaticMatrix}
+                                    d={row.dupTrianglePath}
+                                    fill={`url(#preset1-diamond-grad-${row.i})`}
+                                  />
                                 ) : (
                                   <g transform={`rotate(${PRESET_2_SHAPE_ROTATION_DEG} ${row.dupCx} ${row.dupCy})`}>
                                     <path d={row.dupTrianglePath} fill={`url(#preset1-diamond-grad-${row.i}-conveyor)`} />
@@ -2644,23 +2657,36 @@ export default function Page() {
                     const off1 = Math.max(0, 1 - s)
                     const off2 = Math.max(0, 1 - s * (2 / 3))
                     const off3 = Math.max(0, 1 - s * (1 / 3))
+                    /** Preset 2 parade: user-space gradients stay fixed while geometry moves under SMIL → apparent slip; OBB ties paint to each path’s bbox. */
+                    const preset2ParadeOBB = preset2DiamondRef && preset1DiamondParadeEnabled
                     return (
                       <React.Fragment key={i}>
                         <linearGradient
                           id={`preset1-diamond-grad-${i}`}
-                          x1={gradCx}
-                          y1={gradCy - r}
-                          x2={gradCx}
-                          y2={gradCy + r}
-                          gradientUnits="userSpaceOnUse"
-                          gradientTransform={`rotate(${gradAngle} ${gradCx} ${gradCy})`}
+                          {...(preset2ParadeOBB
+                            ? {
+                                gradientUnits: "objectBoundingBox" as const,
+                                x1: "0.5",
+                                y1: "0",
+                                x2: "0.5",
+                                y2: "1",
+                                spreadMethod: "pad" as const,
+                              }
+                            : {
+                                gradientUnits: "userSpaceOnUse" as const,
+                                x1: gradCx,
+                                y1: gradCy - r,
+                                x2: gradCx,
+                                y2: gradCy + r,
+                                gradientTransform: `rotate(${gradAngle} ${gradCx} ${gradCy})`,
+                              })}
                         >
                           <stop offset={off1} stopColor={invertStopColors ? gradientColors[3] : gradientColors[0]} />
                           <stop offset={off2} stopColor={invertStopColors ? gradientColors[2] : gradientColors[1]} />
                           <stop offset={off3} stopColor={invertStopColors ? gradientColors[1] : gradientColors[2]} />
                           <stop offset="1" stopColor={invertStopColors ? gradientColors[0] : gradientColors[3]} />
                         </linearGradient>
-                        {preset1DiamondParadeEnabled ? (
+                        {preset1DiamondParadeEnabled && !preset2DiamondRef ? (
                           <linearGradient
                             id={`preset1-diamond-grad-${i}-conveyor`}
                             x1={dupGradCx}
